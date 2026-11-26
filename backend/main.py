@@ -1,17 +1,18 @@
 """
-Git仓库接入体检工具 - v0.3（评分 + 风险分级）
+Git仓库接入体检工具 - v0.4（多平台 + AI 接入建议）
 当前能力范围：
-  ✅ 解析 GitHub 仓库链接 → 提取 owner/repo
-  ✅ 调用 GitHub API 获取仓库文件树
+  ✅ 解析 GitHub / Gitee 仓库链接 → 提取 provider/owner/repo
+  ✅ 调用平台 API 获取仓库文件树
   ✅ 文件级检测：README / 依赖文件 / Windows 脚本后缀
   ✅ 异步并发拉取文本文件内容（Contents API，base64 解码）
   ✅ 正则扫描：硬编码路径（C:\\、/Users/、/home/）、sk- 密钥串
   ✅ 大仓库保护：二进制后缀跳过 + 单仓库最多扫描 200 文件 + 并发信号量
   ✅ 评分计算：满分 100，扣分制，扣分项逐条列出
   ✅ 风险分级：CRITICAL / HIGH / MEDIUM / LOW / CLEAN，密钥自动脱敏
-  ✅ Pydantic 请求/响应结构
-  ✅ 基础异常捕获
-暂不做：AI 建议、增量更新、Gitee 兼容
+  ✅ 异步任务 + 轮询进度（POST /api/scan + GET /api/tasks/{id}）
+  ✅ AI 接入建议：DeepSeek 生成，密钥为空自动禁用且不影响基础扫描
+  ✅ Pydantic 请求/响应结构 + 基础异常捕获
+暂不做：增量更新、私有仓库授权
 """
 
 import asyncio
@@ -21,6 +22,7 @@ import logging
 import os
 import re
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -44,31 +46,59 @@ logger = logging.getLogger("git_repo_inspector")
 # ========== 1. 读取环境变量 ==========
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITEE_TOKEN = os.getenv("GITEE_TOKEN", "")          # 可选：Gitee 公开仓库匿名亦可访问
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+# AI 建议开关：密钥为空则自动禁用，不抛异常，不影响基础扫描
+AI_ENABLED = bool(DEEPSEEK_API_KEY.strip())
 
 GITHUB_API_BASE = "https://api.github.com"
+
+# ---------- 仓库托管平台配置（GitHub / Gitee） ----------
+PROVIDER_GITHUB = "github"
+PROVIDER_GITEE = "gitee"
+
+PROVIDER_API_BASE = {
+    PROVIDER_GITHUB: "https://api.github.com",
+    PROVIDER_GITEE: "https://gitee.com/api/v5",
+}
+PROVIDER_DOMAIN = {
+    PROVIDER_GITHUB: "github.com",
+    PROVIDER_GITEE: "gitee.com",
+}
+PROVIDER_LABEL = {
+    PROVIDER_GITHUB: "GitHub",
+    PROVIDER_GITEE: "Gitee",
+}
+
+# ---------- DeepSeek（AI 接入建议）配置 ----------
+DEEPSEEK_API_BASE = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_TIMEOUT = 45.0
+AI_ADVICE_MAX_TOKENS = 900
 
 
 # ========== 2. Pydantic 定义 ==========
 class ScanRequest(BaseModel):
-    """请求体：只需要 GitHub 仓库链接"""
-    repo_url: str = Field(..., description="公开 GitHub 仓库链接，如 https://github.com/owner/repo")
+    """请求体：仓库链接（支持 GitHub / Gitee 公开仓库）"""
+    repo_url: str = Field(..., description="公开仓库链接，如 https://github.com/owner/repo 或 https://gitee.com/owner/repo")
 
     @field_validator("repo_url")
     @classmethod
-    def validate_github_url(cls, v: str) -> str:
+    def validate_repo_url(cls, v: str) -> str:
         """Pydantic 校验：在进入业务逻辑前先做基础校验"""
         if not v or not v.strip():
             raise ValueError("仓库链接不能为空")
         v = v.strip().rstrip("/")
         lower = v.lower()
-        # 必须是 github.com 域名（排除 Gitee/GitLab/自建 Git 服务）
-        if "github.com" not in lower:
-            raise ValueError("目前仅支持 github.com 仓库链接，请提供以 github.com 开头的 URL")
+        # 仅支持 GitHub / Gitee
+        if not ("github.com" in lower or "gitee.com" in lower):
+            raise ValueError("目前仅支持 github.com 或 gitee.com 仓库链接")
         # 必须有协议头或 SSH 格式
         if not (lower.startswith("https://") or lower.startswith("http://") or lower.startswith("git@")):
-            raise ValueError("链接格式不正确，请以 https://github.com/owner/repo 开头")
-        # 排除明显的坏链接
-        if lower.endswith("github.com") or lower.endswith("github.com/"):
+            raise ValueError("链接格式不正确，请以 https://github.com/owner/repo 或 https://gitee.com/owner/repo 开头")
+        # 排除只写了域名的坏链接
+        if lower.endswith("github.com") or lower.endswith("gitee.com"):
             raise ValueError("链接缺少 owner/repo 路径，请提供完整仓库链接")
         return v
 
@@ -79,6 +109,7 @@ class RepoInfo(BaseModel):
     repo: str
     default_branch: str
     total_files: int
+    provider: str = PROVIDER_GITHUB   # "github" / "gitee"（默认值保证旧接口兼容）
 
 
 class ReadinessCheck(BaseModel):
@@ -129,6 +160,16 @@ class ScanSummary(BaseModel):
     risk_items: List[RiskItem]
 
 
+class AiAdvice(BaseModel):
+    """AI 接入建议（DeepSeek 生成；未配置密钥时自动禁用）"""
+    enabled: bool                       # AI 模块是否启用（密钥非空）
+    provider: str = "deepseek"          # AI 服务商
+    model: Optional[str] = None         # 模型名
+    content: Optional[str] = None       # 建议正文（Markdown 文本）
+    message: Optional[str] = None       # 禁用 / 失败时的提示文案
+    error: Optional[str] = None         # 调用失败时的错误摘要
+
+
 class ScanResponse(BaseModel):
     """POST /api/scan 返回结构"""
     repo_info: RepoInfo
@@ -136,6 +177,7 @@ class ScanResponse(BaseModel):
     risk_brief: RiskBrief
     content_scan: Optional[ContentScanResult] = None  # 内容扫描结果
     summary: Optional[ScanSummary] = None             # 新增：评分 + 风险汇总
+    ai_advice: Optional[AiAdvice] = None              # 新增：AI 接入建议（可选，向后兼容）
 
 
 class ErrorResponse(BaseModel):
@@ -245,57 +287,105 @@ RISK_CLEAN = "CLEAN"         # 无风险
 
 
 # ========== 4. 工具函数 ==========
-def parse_github_url(url: str) -> tuple[str, str]:
+def parse_repo_url(url: str) -> Tuple[str, str, str]:
     """
-    从 GitHub 仓库链接提取 (owner, repo)。
+    从仓库链接提取 (provider, owner, repo)，支持 GitHub / Gitee。
     支持格式：
       https://github.com/owner/repo
       https://github.com/owner/repo.git
       https://github.com/owner/repo/tree/main/...
       git@github.com:owner/repo.git
+      https://gitee.com/owner/repo(.git)
+      git@gitee.com:owner/repo.git
     解析失败则抛 ValueError。
     """
     url = url.strip().rstrip("/")
 
-    # SSH 格式：git@github.com:owner/repo.git
-    ssh_match = re.match(r"git@github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
-    if ssh_match:
-        return ssh_match.group(1), ssh_match.group(2)
+    for provider in (PROVIDER_GITHUB, PROVIDER_GITEE):
+        domain = PROVIDER_DOMAIN[provider]
+        domain_re = re.escape(domain)
 
-    # HTTPS 格式
-    https_match = re.match(
-        r"https?://(?:www\.)?github\.com/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$",
-        url,
-    )
-    if https_match:
-        return https_match.group(1), https_match.group(2)
+        # SSH 格式：git@github.com:owner/repo.git
+        ssh_match = re.match(rf"git@{domain_re}[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+        if ssh_match:
+            return provider, ssh_match.group(1), ssh_match.group(2)
 
-    raise ValueError(f"无法解析 GitHub 仓库链接：{url}")
+        # HTTPS 格式
+        https_match = re.match(
+            rf"https?://(?:www\.)?{domain_re}/([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$",
+            url,
+        )
+        if https_match:
+            return provider, https_match.group(1), https_match.group(2)
+
+    raise ValueError(f"无法解析仓库链接（仅支持 GitHub / Gitee）：{url}")
 
 
-def _is_github_rate_limited(resp: httpx.Response) -> Optional[str]:
+def parse_github_url(url: str) -> Tuple[str, str]:
+    """向后兼容封装：仅返回 (owner, repo)"""
+    _, owner, repo = parse_repo_url(url)
+    return owner, repo
+
+
+def _is_github_rate_limited(resp: httpx.Response, provider: str = PROVIDER_GITHUB) -> Optional[str]:
     """
-    通过 GitHub 响应 headers 判断是否限流。
-    返回限流描述字符串（含重置时间）；非限流返回 None。
+    判断平台响应是否属于限流 / 匿名访问被拒。
+    返回提示字符串（含平台名与重置时间）；非限流返回 None。
     """
+    label = _provider_label(provider)
+    token_name = "GITHUB_TOKEN" if provider == PROVIDER_GITHUB else "GITEE_TOKEN"
+
     remaining = resp.headers.get(GH_HEADER_RATELIMIT_REMAINING, "")
     reset_ts = resp.headers.get(GH_HEADER_RATELIMIT_RESET, "")
-    if remaining == "0" or (resp.status_code == 403 and "rate limit" in resp.text.lower()):
-        reset_msg = ""
-        if reset_ts and reset_ts.isdigit():
-            import datetime
-            reset_time = datetime.datetime.fromtimestamp(int(reset_ts)).strftime("%Y-%m-%d %H:%M:%S")
-            reset_msg = f"，额度重置时间：{reset_time}"
-        return f"GitHub API 限流{reset_msg}（建议配置 GITHUB_TOKEN）"
-    return None
+
+    limited = False
+    if provider == PROVIDER_GITHUB and remaining == "0":
+        limited = True
+    elif resp.status_code == 403 and "rate limit" in resp.text.lower():
+        limited = True
+    elif provider == PROVIDER_GITEE and resp.status_code == 403:
+        # Gitee 匿名访问超频或需要令牌时统一返回 403
+        limited = True
+
+    if not limited:
+        return None
+
+    reset_msg = ""
+    if reset_ts and reset_ts.isdigit():
+        import datetime
+        reset_time = datetime.datetime.fromtimestamp(int(reset_ts)).strftime("%Y-%m-%d %H:%M:%S")
+        reset_msg = f"，额度重置时间：{reset_time}"
+
+    if provider == PROVIDER_GITEE:
+        return f"{label} API 拒绝访问（403）{reset_msg}，可能触发匿名访问频率限制，建议在 .env 配置 {token_name}"
+    return f"{label} API 限流{reset_msg}（建议配置 {token_name}）"
+
+
+def _provider_headers(provider: str = PROVIDER_GITHUB) -> Dict[str, str]:
+    """构造平台 API 请求 headers（GitHub 支持可选 token）"""
+    if provider == PROVIDER_GITHUB:
+        headers = {"Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        return headers
+    return {"Accept": "application/json"}
+
+
+def _provider_params(provider: str = PROVIDER_GITHUB, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """构造平台 API 请求 query 参数（Gitee 用 access_token 传参）"""
+    params: Dict[str, str] = dict(extra or {})
+    if provider == PROVIDER_GITEE and GITEE_TOKEN:
+        params["access_token"] = GITEE_TOKEN
+    return params
+
+
+def _provider_label(provider: str) -> str:
+    return PROVIDER_LABEL.get(provider, provider)
 
 
 def _github_auth_headers() -> Dict[str, str]:
-    """构造 GitHub API 请求 headers（含可选 token）"""
-    headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return headers
+    """向后兼容封装"""
+    return _provider_headers(PROVIDER_GITHUB)
 
 
 async def _get_shared_client() -> httpx.AsyncClient:
@@ -306,64 +396,67 @@ async def _get_shared_client() -> httpx.AsyncClient:
     return _shared_client
 
 
-async def fetch_repo_info(owner: str, repo: str) -> dict:
-    """调用 GitHub /repos/{owner}/{repo} 获取仓库元信息（含 default_branch）"""
+async def fetch_repo_info(owner: str, repo: str, provider: str = PROVIDER_GITHUB) -> dict:
+    """调用 /repos/{owner}/{repo} 获取仓库元信息（含 default_branch），支持 GitHub / Gitee"""
+    label = _provider_label(provider)
     client = await _get_shared_client()
     try:
         resp = await client.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}",
-            headers=_github_auth_headers(),
+            f"{PROVIDER_API_BASE[provider]}/repos/{owner}/{repo}",
+            headers=_provider_headers(provider),
+            params=_provider_params(provider),
         )
     except httpx.TimeoutException:
         logger.error("fetch_repo_info 超时: %s/%s", owner, repo)
-        raise HTTPException(status_code=504, detail=f"GitHub API 请求超时：{owner}/{repo}")
+        raise HTTPException(status_code=504, detail=f"{label} API 请求超时：{owner}/{repo}")
     except httpx.NetworkError as e:
         logger.error("fetch_repo_info 网络错误: %s/%s - %s", owner, repo, e)
-        raise HTTPException(status_code=502, detail=f"无法连接 GitHub：{e}")
+        raise HTTPException(status_code=502, detail=f"无法连接 {label}：{e}")
 
     if resp.status_code == 404:
         logger.warning("仓库不存在或私有: %s/%s", owner, repo)
         raise HTTPException(status_code=404, detail=f"仓库不存在或为私有仓库：{owner}/{repo}")
     if resp.status_code == 401:
-        logger.error("GitHub Token 无效")
-        raise HTTPException(status_code=401, detail="GitHub Token 无效，请检查 .env 中的 GITHUB_TOKEN")
-    rate_limit_msg = _is_github_rate_limited(resp)
+        logger.error("%s Token 无效", label)
+        raise HTTPException(status_code=401, detail=f"{label} Token 无效，请检查 .env 中的 {provider.upper()}_TOKEN")
+    rate_limit_msg = _is_github_rate_limited(resp, provider)
     if rate_limit_msg:
-        logger.warning("GitHub API 限流: %s", rate_limit_msg)
+        logger.warning("%s API 限流: %s", label, rate_limit_msg)
         raise HTTPException(status_code=429, detail=rate_limit_msg)
     if resp.status_code != 200:
         logger.error("fetch_repo_info 失败: %s %s", resp.status_code, resp.text[:200])
-        raise HTTPException(status_code=502, detail=f"GitHub API 调用失败：{resp.status_code} {resp.text[:200]}")
+        raise HTTPException(status_code=502, detail=f"{label} API 调用失败：{resp.status_code} {resp.text[:200]}")
 
     logger.info("仓库元信息获取成功: %s/%s branch=%s", owner, repo, resp.json().get("default_branch"))
     return resp.json()
 
 
-async def fetch_file_tree(owner: str, repo: str, branch: str) -> List[str]:
+async def fetch_file_tree(owner: str, repo: str, branch: str, provider: str = PROVIDER_GITHUB) -> List[str]:
     """
-    调用 GitHub /repos/{owner}/{repo}/git/trees/{branch}?recursive=1
-    拉取完整文件树，返回所有文件路径列表（不含目录）。
+    调用 /repos/{owner}/{repo}/git/trees/{branch}?recursive=1
+    拉取完整文件树，返回所有文件路径列表（不含目录），支持 GitHub / Gitee。
     """
+    label = _provider_label(provider)
     client = await _get_shared_client()
     try:
         resp = await client.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
-            params={"recursive": "1"},
-            headers=_github_auth_headers(),
+            f"{PROVIDER_API_BASE[provider]}/repos/{owner}/{repo}/git/trees/{branch}",
+            params=_provider_params(provider, {"recursive": "1"}),
+            headers=_provider_headers(provider),
         )
     except httpx.TimeoutException:
         logger.error("fetch_file_tree 超时: %s/%s branch=%s", owner, repo, branch)
         raise HTTPException(status_code=504, detail=f"拉取文件树超时：{branch}")
     except httpx.NetworkError as e:
         logger.error("fetch_file_tree 网络错误: %s/%s - %s", owner, repo, e)
-        raise HTTPException(status_code=502, detail=f"无法连接 GitHub：{e}")
+        raise HTTPException(status_code=502, detail=f"无法连接 {label}：{e}")
 
     if resp.status_code == 404:
         logger.warning("分支不存在: %s/%s branch=%s", owner, repo, branch)
         raise HTTPException(status_code=404, detail=f"分支不存在：{branch}")
-    rate_limit_msg = _is_github_rate_limited(resp)
+    rate_limit_msg = _is_github_rate_limited(resp, provider)
     if rate_limit_msg:
-        logger.warning("GitHub API 限流(文件树): %s", rate_limit_msg)
+        logger.warning("%s API 限流(文件树): %s", label, rate_limit_msg)
         raise HTTPException(status_code=429, detail=rate_limit_msg)
     if resp.status_code != 200:
         logger.error("fetch_file_tree 失败: %s %s", resp.status_code, resp.text[:200])
@@ -424,18 +517,20 @@ def should_skip_file(path: str) -> bool:
     return False
 
 
-async def fetch_file_content(owner: str, repo: str, branch: str, file_path: str) -> Optional[str]:
+async def fetch_file_content(
+    owner: str, repo: str, branch: str, file_path: str, provider: str = PROVIDER_GITHUB
+) -> Optional[str]:
     """
-    调用 GitHub Contents API 拉取单个文件内容。
+    调用 Contents API 拉取单个文件内容（GitHub / Gitee）。
     返回解码后的文本；拉取失败则返回 None（但不吞异常，调用方会记日志）。
     """
     client = await _get_shared_client()
     try:
         async with CONTENT_SEMAPHORE:
             resp = await client.get(
-                f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{file_path}",
-                params={"ref": branch},
-                headers=_github_auth_headers(),
+                f"{PROVIDER_API_BASE[provider]}/repos/{owner}/{repo}/contents/{file_path}",
+                params=_provider_params(provider, {"ref": branch}),
+                headers=_provider_headers(provider),
             )
     except httpx.TimeoutException:
         logger.debug("fetch_file_content 超时: %s", file_path)
@@ -498,6 +593,7 @@ async def run_content_scan(
     owner: str, repo: str, branch: str, file_paths: List[str],
     task_id: Optional[str] = None,
     progress_cb: Optional[Callable[[str, int, str], None]] = None,
+    provider: str = PROVIDER_GITHUB,
 ) -> ContentScanResult:
     """
     并发拉取文件内容 + 正则扫描。
@@ -519,7 +615,7 @@ async def run_content_scan(
     # 阶段1：并发拉取（最耗时的环节）
     if progress_cb and task_id:
         progress_cb(task_id, 40, f"开始拉取 {len(candidates)} 个文件内容...")
-    tasks = [fetch_file_content(owner, repo, branch, p) for p in candidates]
+    tasks = [fetch_file_content(owner, repo, branch, p, provider) for p in candidates]
     contents = await asyncio.gather(*tasks, return_exceptions=True)
     # 拉取完成 → 40→70
     if progress_cb and task_id:
@@ -696,6 +792,166 @@ def build_risk_items(
     return items, overall
 
 
+# ---------- AI 接入建议（DeepSeek，可选能力） ----------
+def _build_ai_prompt(
+    provider: str,
+    owner: str,
+    repo: str,
+    default_branch: str,
+    total_files: int,
+    readiness: ReadinessCheck,
+    risk: RiskBrief,
+    content_scan: ContentScanResult,
+    summary: ScanSummary,
+) -> str:
+    """把扫描结果压缩成结构化 prompt，交给 DeepSeek 生成接入建议"""
+    # 内容命中按类型聚合，避免 prompt 过长
+    hit_groups: Dict[str, List[str]] = {}
+    for hit in content_scan.hits:
+        hit_groups.setdefault(hit.hit_type, []).append(hit.file_path)
+
+    hit_lines = []
+    for hit_type, files in hit_groups.items():
+        uniq_files = sorted(set(files))[:10]
+        hit_lines.append(f"- {hit_type}: {len(files)} 处命中，涉及文件（最多10个）：{', '.join(uniq_files)}")
+    if not hit_lines:
+        hit_lines.append("- 无内容级风险命中")
+
+    deduction_lines = [
+        f"- {d.get('item')}：{d.get('points')} 分" for d in summary.score_detail.deductions
+    ] or ["- 无扣分项"]
+
+    return f"""你是一名代码仓库接入评审专家。请基于以下自动化扫描结果，给出简洁、可执行的接入建议。
+
+## 仓库信息
+- 平台：{_provider_label(provider)}
+- 仓库：{owner}/{repo}
+- 默认分支：{default_branch}
+- 文件总数：{total_files}
+
+## 完备度
+- README：{"存在" if readiness.has_readme else "缺失"}
+- 依赖清单：{", ".join(readiness.found_dependency_files) if readiness.found_dependency_files else "未发现"}
+
+## 风险
+- Windows 危险脚本（.bat/.cmd/.ps1/.vbs）：{len(risk.windows_script_files)} 个
+- 内容扫描文件数：{content_scan.scanned_files}
+- 风险命中：
+{chr(10).join(hit_lines)}
+
+## 评分
+- 接入就绪度：{summary.score}/100
+- 风险等级：{summary.risk_level}
+- 扣分明细：
+{chr(10).join(deduction_lines)}
+
+## 输出要求
+请用中文输出，严格分为三部分，每部分用「### 」标题：
+### 接入结论
+一句话结论 + 是否建议接入（建议接入 / 有条件接入 / 不建议接入）。
+### 主要问题
+按严重程度列出 2-5 条，每条一行，说明问题与影响。
+### 接入建议
+列出 2-5 条可执行动作，每条一行，具体到要做什么。
+总字数控制在 400 字以内，不要输出与以上结构无关的内容。"""
+
+
+async def generate_ai_advice(
+    provider: str,
+    owner: str,
+    repo: str,
+    default_branch: str,
+    total_files: int,
+    readiness: ReadinessCheck,
+    risk: RiskBrief,
+    content_scan: ContentScanResult,
+    summary: ScanSummary,
+) -> AiAdvice:
+    """
+    调用 DeepSeek 生成接入建议。
+    密钥为空 → 返回 enabled=False 的禁用态，不抛异常。
+    调用失败 → 返回带 error 的降级结果，不抛异常，不影响基础扫描。
+    """
+    if not AI_ENABLED:
+        logger.info("未配置 DEEPSEEK_API_KEY，AI 建议模块自动禁用")
+        return AiAdvice(
+            enabled=False,
+            model=None,
+            message="未配置 DEEPSEEK_API_KEY，AI 建议模块已自动禁用；基础扫描功能不受影响。",
+        )
+
+    prompt = _build_ai_prompt(
+        provider, owner, repo, default_branch, total_files,
+        readiness, risk, content_scan, summary,
+    )
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是严谨的代码仓库接入评审专家，只输出要求的结构化内容。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": AI_ADVICE_MAX_TOKENS,
+        "stream": False,
+    }
+
+    client = await _get_shared_client()
+    try:
+        resp = await client.post(
+            f"{DEEPSEEK_API_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=DEEPSEEK_TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        logger.warning("DeepSeek 请求超时，降级返回")
+        return AiAdvice(enabled=True, model=DEEPSEEK_MODEL,
+                        message="AI 建议生成超时，本次仅返回基础扫描结果。",
+                        error="timeout")
+    except httpx.NetworkError as e:
+        logger.warning("DeepSeek 网络错误: %s", e)
+        return AiAdvice(enabled=True, model=DEEPSEEK_MODEL,
+                        message="AI 服务连接失败，本次仅返回基础扫描结果。",
+                        error=f"network: {e}")
+    except Exception as e:
+        logger.exception("DeepSeek 调用异常: %s", e)
+        return AiAdvice(enabled=True, model=DEEPSEEK_MODEL,
+                        message="AI 建议生成异常，本次仅返回基础扫描结果。",
+                        error=f"{type(e).__name__}: {e}")
+
+    if resp.status_code == 401:
+        logger.warning("DeepSeek API Key 无效")
+        return AiAdvice(enabled=True, model=DEEPSEEK_MODEL,
+                        message="DEEPSEEK_API_KEY 无效，AI 建议已降级跳过。",
+                        error="401 invalid api key")
+    if resp.status_code != 200:
+        logger.warning("DeepSeek 返回异常状态: %s %s", resp.status_code, resp.text[:200])
+        return AiAdvice(enabled=True, model=DEEPSEEK_MODEL,
+                        message="AI 服务返回异常，本次仅返回基础扫描结果。",
+                        error=f"{resp.status_code}: {resp.text[:200]}")
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, ValueError, AttributeError) as e:
+        logger.warning("DeepSeek 响应解析失败: %s", e)
+        return AiAdvice(enabled=True, model=DEEPSEEK_MODEL,
+                        message="AI 建议解析失败，本次仅返回基础扫描结果。",
+                        error=f"parse: {e}")
+
+    logger.info("DeepSeek 接入建议生成成功，长度 %d", len(content))
+    return AiAdvice(
+        enabled=True,
+        model=DEEPSEEK_MODEL,
+        content=content,
+        message="AI 建议生成成功",
+    )
+
+
 # ========== 4.5 异步任务模块（扫描进度轮询） ==========
 class TaskStatus(str, enum.Enum):
     PENDING = "pending"
@@ -759,21 +1015,19 @@ async def _do_scan(task_id: str, repo_url: str) -> ScanResponse:
     核心扫描逻辑（和原 scan_repo 完全一致），带进度回写。
     不直接抛异常，内部捕获后通过 TaskInfo.error 回写。
     """
-    import traceback
-
-    # 步骤1：解析链接
-    owner, repo = parse_github_url(repo_url)
-    scan_start_log = f"{owner}/{repo}"
+    # 步骤1：解析链接（GitHub / Gitee）
+    provider, owner, repo = parse_repo_url(repo_url)
+    scan_start_log = f"{_provider_label(provider)}:{owner}/{repo}"
     logger.info("[task=%s] 开始扫描: %s", task_id, scan_start_log)
-    _update_progress(task_id, 5, "解析仓库链接...")
+    _update_progress(task_id, 5, f"解析仓库链接（{_provider_label(provider)}）...")
 
     # 步骤2：拉仓库元信息
-    repo_meta = await fetch_repo_info(owner, repo)
+    repo_meta = await fetch_repo_info(owner, repo, provider)
     default_branch = repo_meta["default_branch"]
     _update_progress(task_id, 15, f"获取仓库信息完成，分支 {default_branch}")
 
     # 步骤3：拉文件树
-    file_paths = await fetch_file_tree(owner, repo, default_branch)
+    file_paths = await fetch_file_tree(owner, repo, default_branch, provider)
     _update_progress(task_id, 25, f"获取文件树完成，共 {len(file_paths)} 个文件")
 
     # 步骤4：文件级检测
@@ -785,7 +1039,10 @@ async def _do_scan(task_id: str, repo_url: str) -> ScanResponse:
     _update_progress(task_id, 35, f"文件级检测完成")
 
     # 步骤4.5：内容扫描
-    content_scan = await run_content_scan(owner, repo, default_branch, file_paths, task_id=task_id, progress_cb=_update_progress)
+    content_scan = await run_content_scan(
+        owner, repo, default_branch, file_paths,
+        task_id=task_id, progress_cb=_update_progress, provider=provider,
+    )
     _update_progress(task_id, 85, f"内容扫描完成，命中 {len(content_scan.hits)} 条")
 
     # 步骤4.6：评分 + 分级
@@ -797,16 +1054,30 @@ async def _do_scan(task_id: str, repo_url: str) -> ScanResponse:
         risk_level=risk_level,
         risk_items=risk_items,
     )
-    _update_progress(task_id, 95, "生成评分与风险报告...")
+    _update_progress(task_id, 92, "生成评分与风险报告...")
     logger.info("[task=%s] 扫描完成: %s score=%d risk=%s hits=%d",
                 task_id, scan_start_log, summary.score, summary.risk_level, len(content_scan.hits))
 
+    # 步骤4.7：AI 接入建议（可选，密钥为空自动禁用，失败不影响主流程）
+    ai_advice: AiAdvice
+    if AI_ENABLED:
+        _update_progress(task_id, 95, "正在生成 AI 接入建议...")
+    ai_advice = await generate_ai_advice(
+        provider, owner, repo, default_branch, len(file_paths),
+        readiness, risk, content_scan, summary,
+    )
+    _update_progress(task_id, 99, "AI 建议处理完成")
+
     return ScanResponse(
-        repo_info=RepoInfo(owner=owner, repo=repo, default_branch=default_branch, total_files=len(file_paths)),
+        repo_info=RepoInfo(
+            owner=owner, repo=repo, default_branch=default_branch,
+            total_files=len(file_paths), provider=provider,
+        ),
         readiness=readiness,
         risk_brief=risk,
         content_scan=content_scan,
         summary=summary,
+        ai_advice=ai_advice,
     )
 
 
@@ -928,7 +1199,7 @@ async def create_scan_task(req: ScanRequest):
     # （Pydantic validator 已经在 ScanRequest 上做了 github.com 域名校验，
     #  这里再做 parse_github_url 验证路径格式）
     try:
-        parse_github_url(req.repo_url)
+        parse_repo_url(req.repo_url)
     except ValueError as e:
         logger.warning("链接解析失败: %s - %s", req.repo_url, e)
         raise HTTPException(status_code=400, detail=str(e))
@@ -971,7 +1242,10 @@ async def health():
     """健康检查：返回 token 配置状态和服务版本"""
     return {
         "status": "ok",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "github_token_configured": bool(GITHUB_TOKEN),
         "github_token_masked": (GITHUB_TOKEN[:4] + "****") if GITHUB_TOKEN else None,
+        "gitee_token_configured": bool(GITEE_TOKEN),
+        "ai_advice_enabled": AI_ENABLED,
+        "supported_providers": list(PROVIDER_API_BASE.keys()),
     }
