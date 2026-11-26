@@ -1,0 +1,63 @@
+# ===== Git仓库接入体检工具 - 全局 .gitignore =====
+# 兼顾：Python 后端 + Vue3/Vite 前端
+
+# ==================== Python 后端 ====================
+# 字节码 & 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+.env/
+
+# 环境变量 & 密钥（严格禁止入库）
+.env
+.env.local
+.env.*.local
+*.secret
+*.key
+
+# 日志
+*.log
+logs/
+
+# ==================== Vue3 / Vite 前端 ====================
+# Node 依赖 & 构建产物
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# 前端缓存
+.npm
+.eslintcache
+.cache/
+.turbo/
+
+# ==================== IDE & 编辑器 ====================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ==================== 系统文件 ====================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==================== 测试 & 调试 ====================
+.pytest_cache/
+.coverage
+htmlcov/
+*.py.class
