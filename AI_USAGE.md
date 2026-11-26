@@ -1,7 +1,7 @@
 # AI_USAGE
 
 Git仓库接入体检工具 git_repo_inspector
-AI开发工具：Vibe Coding
+AI开发工具：Vibe Coding（TRAE）
 用途：记录项目开发过程全部提示词，同时记录AI生成错误、人工干预修正的案例。
 
 ## 交互提示词记录（按开发时序）
